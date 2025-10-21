@@ -1,273 +1,459 @@
-# crypto_final_bot.py - ТОП-100 + НОВОСТИ + АВТО-АЛЕРТЫ
-import requests
-import time
-import json
-import re
+# crypto_advanced_bot.py
+import asyncio
+import aiohttp
+import sqlite3
 import pandas as pd
-from datetime import datetime
-from threading import Thread, Lock
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 import logging
+from dataclasses import dataclass
+import json
+import hashlib
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-CONFIG = {
-    'database_path': 'crypto_final.db',
-    'interval': 5 * 60,
-    'min_confidence': 60,
-    'news_check_interval': 10 * 60
-}
+@dataclass
+class CoinData:
+    """Класс для хранения данных монеты"""
+    symbol: str
+    name: str
+    price: float
+    market_cap: float
+    volume_24h: float
+    price_change_24h: float
+    price_change_7d: float
+    timestamp: datetime
 
-EXCLUDE_COINS = ['usdt', 'usdc', 'busd', 'dai', 'tusd', 'ust', 'fdusd', 'pyusd']
+@dataclass
+class TechnicalIndicators:
+    """Технические индикаторы"""
+    sma_20: float = 0
+    ema_12: float = 0
+    ema_26: float = 0
+    rsi: float = 0
+    macd: float = 0
+    macd_signal: float = 0
+    macd_histogram: float = 0
+    volume_sma: float = 0
 
-class NewsMonitor:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        self.last_news = {}
+class DatabaseManager:
+    """Менеджер базы данных"""
     
-    def get_crypto_news(self):
-        """Получает последние крипто-новости"""
+    def __init__(self, db_path: str = "crypto_bot.db"):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """Инициализация таблиц БД"""
+        with sqlite3.connect(self.db_path) as conn:
+            # Таблица исторических данных
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS coin_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    market_cap REAL NOT NULL,
+                    volume_24h REAL NOT NULL,
+                    price_change_24h REAL NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    UNIQUE(symbol, timestamp)
+                )
+            ''')
+            
+            # Таблица сигналов
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    score INTEGER NOT NULL,
+                    price REAL NOT NULL,
+                    signal_type TEXT NOT NULL,
+                    analysis TEXT NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE
+                )
+            ''')
+            
+            # Таблица фидбека
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_id INTEGER,
+                    symbol TEXT NOT NULL,
+                    feedback_type TEXT NOT NULL,
+                    user_comment TEXT,
+                    timestamp DATETIME NOT NULL,
+                    FOREIGN KEY(signal_id) REFERENCES signals(id)
+                )
+            ''')
+            
+            # Таблица технических индикаторов
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS technical_indicators (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    sma_20 REAL,
+                    ema_12 REAL,
+                    ema_26 REAL,
+                    rsi REAL,
+                    macd REAL,
+                    macd_signal REAL,
+                    macd_histogram REAL,
+                    volume_sma REAL,
+                    UNIQUE(symbol, timestamp)
+                )
+            ''')
+            
+            conn.commit()
+    
+    async def save_coin_data(self, coin_data: CoinData):
+        """Сохраняет данные монеты в БД"""
         try:
-            url = "https://api.coingecko.com/api/v3/news"
-            response = self.session.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                news_data = response.json()
-                return self.process_news(news_data.get('data', []))
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('''
+                    INSERT OR REPLACE INTO coin_history 
+                    (symbol, price, market_cap, volume_24h, price_change_24h, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (
+                    coin_data.symbol, coin_data.price, coin_data.market_cap,
+                    coin_data.volume_24h, coin_data.price_change_24h, coin_data.timestamp
+                ))
+                conn.commit()
         except Exception as e:
-            logging.error(f"❌ Ошибка загрузки новостей: {e}")
-        
-        return []
+            logger.error(f"Ошибка сохранения данных монеты: {e}")
     
-    def process_news(self, news_items):
-        """Обрабатывает новости и извлекает монеты"""
-        processed_news = []
+    async def get_historical_data(self, symbol: str, days: int = 30) -> pd.DataFrame:
+        """Получает исторические данные для расчета индикаторов"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                df = pd.read_sql('''
+                    SELECT symbol, price, volume_24h, timestamp
+                    FROM coin_history 
+                    WHERE symbol = ? AND timestamp >= datetime('now', ?)
+                    ORDER BY timestamp
+                ''', conn, params=(symbol, f'-{days} days'))
+                return df
+        except Exception as e:
+            logger.error(f"Ошибка получения исторических данных: {e}")
+            return pd.DataFrame()
+    
+    async def save_signal(self, symbol: str, score: int, price: float, 
+                         signal_type: str, analysis: dict):
+        """Сохраняет сигнал в БД"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute('''
+                    INSERT INTO signals 
+                    (symbol, score, price, signal_type, analysis, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (symbol, score, price, signal_type, json.dumps(analysis), datetime.now()))
+                conn.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Ошибка сохранения сигнала: {e}")
+            return None
+    
+    async def save_feedback(self, signal_id: int, symbol: str, 
+                          feedback_type: str, comment: str = ""):
+        """Сохраняет фидбек пользователя"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('''
+                    INSERT INTO feedback 
+                    (signal_id, symbol, feedback_type, user_comment, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (signal_id, symbol, feedback_type, comment, datetime.now()))
+                
+                # Деактивируем сигнал после фидбека
+                conn.execute('''
+                    UPDATE signals SET is_active = FALSE WHERE id = ?
+                ''', (signal_id,))
+                
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Ошибка сохранения фидбека: {e}")
+
+class TechnicalAnalyzer:
+    """Анализатор технических индикаторов"""
+    
+    @staticmethod
+    def calculate_sma(prices: List[float], window: int) -> float:
+        """Простое скользящее среднее"""
+        if len(prices) < window:
+            return prices[-1] if prices else 0
+        return np.mean(prices[-window:])
+    
+    @staticmethod
+    def calculate_ema(prices: List[float], window: int) -> float:
+        """Экспоненциальное скользящее среднее"""
+        if not prices:
+            return 0
+        series = pd.Series(prices)
+        return series.ewm(span=window, adjust=False).mean().iloc[-1]
+    
+    @staticmethod
+    def calculate_rsi(prices: List[float], window: int = 14) -> float:
+        """Индекс относительной силы"""
+        if len(prices) < window + 1:
+            return 50
         
-        for news in news_items[:10]:
-            title = news.get('title', '')
-            description = news.get('description', '')
-            url = news.get('url', '')
+        deltas = np.diff(prices)
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        avg_gain = np.mean(gains[-window:])
+        avg_loss = np.mean(losses[-window:])
+        
+        if avg_loss == 0:
+            return 100
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    
+    @staticmethod
+    def calculate_macd(prices: List[float]) -> Tuple[float, float, float]:
+        """MACD индикатор"""
+        if len(prices) < 26:
+            return 0, 0, 0
+        
+        ema_12 = TechnicalAnalyzer.calculate_ema(prices, 12)
+        ema_26 = TechnicalAnalyzer.calculate_ema(prices, 26)
+        macd = ema_12 - ema_26
+        
+        # Сигнальная линия (EMA от MACD)
+        macd_values = [ema_12 - ema_26 for ema_12, ema_26 in 
+                      zip(pd.Series(prices).ewm(span=12).mean(),
+                          pd.Series(prices).ewm(span=26).mean())]
+        signal = pd.Series(macd_values).ewm(span=9).mean().iloc[-1]
+        histogram = macd - signal
+        
+        return macd, signal, histogram
+    
+    async def calculate_indicators(self, symbol: str, db: DatabaseManager) -> TechnicalIndicators:
+        """Рассчитывает все технические индикаторы"""
+        historical_data = await db.get_historical_data(symbol, 30)
+        
+        if historical_data.empty:
+            return TechnicalIndicators()
+        
+        prices = historical_data['price'].tolist()
+        volumes = historical_data['volume_24h'].tolist()
+        
+        indicators = TechnicalIndicators(
+            sma_20=self.calculate_sma(prices, 20),
+            ema_12=self.calculate_ema(prices, 12),
+            ema_26=self.calculate_ema(prices, 26),
+            rsi=self.calculate_rsi(prices),
+            volume_sma=self.calculate_sma(volumes, 20)
+        )
+        
+        macd, macd_signal, macd_histogram = self.calculate_macd(prices)
+        indicators.macd = macd
+        indicators.macd_signal = macd_signal
+        indicators.macd_histogram = macd_histogram
+        
+        return indicators
+
+class MLPredictor:
+    """ML модель для прогнозирования"""
+    
+    def __init__(self):
+        self.model = None
+        self.is_trained = False
+    
+    async def prepare_features(self, symbol: str, db: DatabaseManager) -> Optional[List[float]]:
+        """Подготавливает фичи для ML модели"""
+        try:
+            historical_data = await db.get_historical_data(symbol, 60)
+            if len(historical_data) < 30:
+                return None
             
-            mentioned_coins = self.extract_coins_from_text(title + " " + description)
+            prices = historical_data['price'].values
+            volumes = historical_data['volume_24h'].values
             
-            if mentioned_coins:
-                news_item = {
-                    'title': title,
-                    'description': description[:200] + "..." if len(description) > 200 else description,
-                    'url': url,
-                    'coins': mentioned_coins,
-                    'timestamp': datetime.now()
-                }
-                processed_news.append(news_item)
-        
-        return processed_news
+            # Базовые фичи
+            features = [
+                # Ценовые фичи
+                prices[-1],  # текущая цена
+                np.mean(prices[-7:]),  # среднее за неделю
+                np.std(prices[-7:]),   # волатильность за неделю
+                
+                # Объемные фичи
+                volumes[-1],  # текущий объем
+                np.mean(volumes[-7:]),  # средний объем за неделю
+                
+                # Технические индикаторы
+                TechnicalAnalyzer.calculate_rsi(prices.tolist()),
+                TechnicalAnalyzer.calculate_ema(prices.tolist(), 12),
+                TechnicalAnalyzer.calculate_ema(prices.tolist(), 26),
+            ]
+            
+            return features
+        except Exception as e:
+            logger.error(f"Ошибка подготовки фич: {e}")
+            return None
     
-    def extract_coins_from_text(self, text):
-        """Извлекает упоминания монет из текста"""
-        text_upper = text.upper()
-        found_coins = []
+    async def predict(self, symbol: str, db: DatabaseManager) -> float:
+        """Прогнозирует потенциал роста (0-100)"""
+        features = await self.prepare_features(symbol, db)
         
-        popular_coins = [
-            'BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'SOL', 'DOT', 'MATIC', 
-            'AVAX', 'LINK', 'ATOM', 'XLM', 'ALGO', 'NEAR', 'FTM', 'SAND', 
-            'MANA', 'GALA', 'APE', 'GMT', 'APT', 'ARB', 'OP', 'SUI', 'RUNE',
-            'PEPE', 'SHIB', 'FLOKI', 'BONK', 'WIF', 'DOGE', 'MEME'
-        ]
+        if not features:
+            return 50  # нейтральный прогноз при отсутствии данных
         
-        for coin in popular_coins:
-            if coin in text_upper:
-                found_coins.append(coin)
+        # Простая эвристическая модель (замените на настоящую ML модель)
+        base_score = 50
         
-        return list(set(found_coins))
-    
-    def check_new_news(self):
-        """Проверяет новые новости и возвращает непрочитанные"""
-        current_news = self.get_crypto_news()
-        new_news = []
+        # Корректировки на основе фич
+        rsi = features[5]
+        if rsi < 30:
+            base_score += 15  # перепроданность
+        elif rsi > 70:
+            base_score -= 15  # перекупленность
         
-        for news in current_news:
-            news_id = f"{news['title']}_{news['timestamp'].strftime('%Y%m%d%H%M')}"
-            if news_id not in self.last_news:
-                new_news.append(news)
-                self.last_news[news_id] = news['timestamp']
+        volume_ratio = features[4] / features[3] if features[3] > 0 else 1
+        if volume_ratio > 1.5:
+            base_score += 10  # растущий объем
         
-        # Очищаем старые новости
-        current_time = datetime.now()
-        expired_news = [
-            news_id for news_id, timestamp in self.last_news.items()
-            if (current_time - timestamp).total_seconds() > 24 * 3600
-        ]
-        for news_id in expired_news:
-            del self.last_news[news_id]
+        ema_ratio = features[6] / features[7] if features[7] > 0 else 1
+        if ema_ratio > 1.02:
+            base_score += 10  # бычий тренд
         
-        return new_news
+        return max(0, min(100, base_score))
 
 class AdvancedAnalyzer:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        self.news_monitor = NewsMonitor()
+    """Продвинутый анализатор"""
     
-    def fetch_top_coins(self):
-        """Загружает топ-100 монет"""
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+        self.technical_analyzer = TechnicalAnalyzer()
+        self.ml_predictor = MLPredictor()
+        self.session = None
+    
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    async def fetch_top_coins(self, limit: int = 100) -> List[Dict]:
+        """Асинхронно загружает топ монет"""
         url = "https://api.coingecko.com/api/v3/coins/markets"
         params = {
             "vs_currency": "usd",
             "order": "market_cap_desc",
-            "per_page": 100,
+            "per_page": limit,
             "page": 1,
             "sparkline": "false",
-            "price_change_percentage": "24h,7d"
+            "price_change_percentage": "24h,7d,30d"
         }
         
         try:
-            logging.info("🔄 Загрузка данных с CoinGecko...")
-            response = self.session.get(url, params=params, timeout=30)
-            if response.status_code == 200:
-                coins = response.json()
-                filtered_coins = [
-                    coin for coin in coins 
-                    if coin['symbol'].lower() not in EXCLUDE_COINS
-                ]
-                logging.info(f"✅ Успешно загружено {len(filtered_coins)} монет")
-                return filtered_coins
-            else:
-                logging.error(f"❌ Ошибка API: {response.status_code}")
+            async with self.session.get(url, params=params, timeout=30) as response:
+                if response.status == 200:
+                    coins = await response.json()
+                    filtered_coins = [
+                        coin for coin in coins 
+                        if coin['symbol'] not in ['usdt', 'usdc', 'busd', 'dai']
+                    ]
+                    logger.info(f"✅ Успешно загружено {len(filtered_coins)} монет")
+                    return filtered_coins
+                else:
+                    logger.error(f"❌ Ошибка API: {response.status}")
+                    return []
         except Exception as e:
-            logging.error(f"❌ Ошибка загрузки монет: {e}")
-        return []
+            logger.error(f"❌ Ошибка загрузки монет: {e}")
+            return []
     
-    def search_coin(self, symbol):
-        """Ищет монету по символу"""
-        symbol = symbol.upper().strip()
-        logging.info(f"🔍 Поиск монеты: {symbol}")
-        
-        # Сначала ищем в топ-100
-        top_coins = self.fetch_top_coins()
-        for coin in top_coins:
-            if coin['symbol'].upper() == symbol:
-                logging.info(f"✅ Найдена монета в топ-100: {symbol}")
-                return coin
-        
-        # Если не нашли в топ-100, пробуем через поиск CoinGecko
-        try:
-            search_url = f"https://api.coingecko.com/api/v3/search?query={symbol}"
-            search_response = self.session.get(search_url, timeout=10)
-            
-            if search_response.status_code == 200:
-                search_data = search_response.json()
-                coins_list = search_data.get('coins', [])
-                
-                if coins_list:
-                    coin_id = coins_list[0]['id']
-                    coin_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
-                    coin_response = self.session.get(coin_url, timeout=10)
-                    
-                    if coin_response.status_code == 200:
-                        coin_data = coin_response.json()
-                        if 'market_data' in coin_data:
-                            logging.info(f"✅ Найдена монета через поиск: {symbol}")
-                            return {
-                                'id': coin_data['id'],
-                                'symbol': coin_data['symbol'].upper(),
-                                'name': coin_data['name'],
-                                'current_price': coin_data['market_data']['current_price']['usd'],
-                                'market_cap': coin_data['market_data']['market_cap']['usd'],
-                                'total_volume': coin_data['market_data']['total_volume']['usd'],
-                                'price_change_percentage_24h': coin_data['market_data']['price_change_percentage_24h']
-                            }
-        except Exception as e:
-            logging.error(f"❌ Ошибка поиска монеты {symbol}: {e}")
-        
-        logging.warning(f"⚠️ Монета не найдена: {symbol}")
-        return None
-    
-    def calculate_coin_score(self, coin):
-        """Расчитывает комплексный счет монеты (0-100)"""
+    async def calculate_advanced_score(self, coin: Dict, indicators: TechnicalIndicators) -> Tuple[int, Dict]:
+        """Расширенный расчет score с ML и техническими индикаторами"""
         score = 0
         analysis = {}
         
         try:
-            # 1. Volume Score (30%)
+            symbol = coin['symbol'].upper()
+            
+            # 1. Базовые метрики (40%)
             volume_ratio = coin['total_volume'] / coin['market_cap'] if coin['market_cap'] > 0 else 0
+            price_change_24h = coin.get('price_change_percentage_24h', 0) or 0
+            
             if volume_ratio > 0.3:
-                score += 30
+                score += 20
                 analysis['volume'] = "🔥 Экстремальный объем"
             elif volume_ratio > 0.15:
-                score += 20
+                score += 15
                 analysis['volume'] = "📈 Высокий объем"
             elif volume_ratio > 0.05:
                 score += 10
                 analysis['volume'] = "💹 Хороший объем"
             
-            # 2. Price Momentum Score (25%)
-            price_change_24h = coin.get('price_change_percentage_24h', 0) or 0
-            if 10 < price_change_24h < 50:
-                score += 25
-                analysis['momentum'] = f"🚀 Сильный рост +{price_change_24h:.1f}%"
-            elif 5 < price_change_24h < 10:
-                score += 15
-                analysis['momentum'] = f"📈 Умеренный рост +{price_change_24h:.1f}%"
-            elif price_change_24h < -20:
-                score += 10
-                analysis['momentum'] = f"💥 Просадка {price_change_24h:.1f}%"
-            
-            # 3. Market Cap Score (20%)
-            market_cap = coin['market_cap']
-            if market_cap < 50000000:
+            if 5 < price_change_24h < 50:
                 score += 20
-                analysis['market_cap'] = "🏦 Малая капа - высокий потенциал"
-            elif market_cap < 200000000:
-                score += 15
-                analysis['market_cap'] = "🏦 Средняя капа"
+                analysis['momentum'] = f"🚀 Рост +{price_change_24h:.1f}%"
             
-            # 4. Risk Adjustment
-            if price_change_24h > 100:
-                score -= 15
-                analysis['risk'] = "⚠️ Перекуплена - высокий риск"
-                
+            # 2. Технические индикаторы (30%)
+            if indicators.rsi < 35:
+                score += 15
+                analysis['rsi'] = f"📊 RSI {indicators.rsi:.1f} - перепроданность"
+            elif indicators.rsi > 65:
+                score -= 10
+                analysis['rsi'] = f"⚠️ RSI {indicators.rsi:.1f} - перекупленность"
+            
+            if indicators.macd > indicators.macd_signal:
+                score += 15
+                analysis['macd'] = "📈 MACD бычий"
+            
+            # 3. ML прогноз (30%)
+            ml_score = await self.ml_predictor.predict(symbol, self.db)
+            ml_contribution = ml_score * 0.3
+            score += ml_contribution
+            analysis['ml'] = f"🤖 ML score: {ml_score:.1f}/100"
+            
+            # 4. Risk adjustment
+            if price_change_24h > 80:
+                score -= 20
+                analysis['risk'] = "💥 Высокий риск коррекции"
+            
         except Exception as e:
-            logging.error(f"❌ Ошибка расчета score: {e}")
+            logger.error(f"❌ Ошибка расчета score: {e}")
         
-        return max(0, min(100, score)), analysis
+        return max(0, min(100, int(score))), analysis
     
-    def get_top_predictions(self, coins_data, top_n=10):
-        """Возвращает топ монет по предсказательной силе"""
-        predictions = []
-        
-        for coin in coins_data:
-            try:
-                score, analysis = self.calculate_coin_score(coin)
-                predictions.append({
-                    'symbol': coin['symbol'].upper(),
-                    'name': coin['name'],
-                    'score': score,
-                    'price': coin['current_price'],
-                    'price_change_24h': coin.get('price_change_percentage_24h', 0) or 0,
-                    'market_cap': coin['market_cap'],
-                    'volume': coin['total_volume'],
-                    'analysis': analysis
-                })
-            except Exception as e:
-                logging.error(f"❌ Ошибка анализа монеты {coin.get('symbol', 'unknown')}: {e}")
-                continue
-        
-        predictions.sort(key=lambda x: x['score'], reverse=True)
-        return predictions[:top_n]
-    
-    def get_coin_analysis(self, symbol):
-        """Детальный анализ конкретной монеты"""
-        coin_data = self.search_coin(symbol)
-        
-        if coin_data:
-            score, analysis = self.calculate_coin_score(coin_data)
+    async def analyze_coin(self, coin_data: Dict) -> Optional[Dict]:
+        """Полный анализ монеты"""
+        try:
+            symbol = coin_data['symbol'].upper()
+            
+            # Сохраняем данные в БД
+            coin_obj = CoinData(
+                symbol=symbol,
+                name=coin_data['name'],
+                price=coin_data['current_price'],
+                market_cap=coin_data['market_cap'],
+                volume_24h=coin_data['total_volume'],
+                price_change_24h=coin_data.get('price_change_percentage_24h', 0) or 0,
+                price_change_7d=coin_data.get('price_change_percentage_7d_in_currency', 0) or 0,
+                timestamp=datetime.now()
+            )
+            await self.db.save_coin_data(coin_obj)
+            
+            # Рассчитываем индикаторы
+            indicators = await self.technical_analyzer.calculate_indicators(symbol, self.db)
+            
+            # Рассчитываем score
+            score, analysis = await self.calculate_advanced_score(coin_data, indicators)
+            
             return {
-                'symbol': symbol.upper(),
+                'symbol': symbol,
                 'name': coin_data['name'],
                 'score': score,
                 'price': coin_data['current_price'],
@@ -276,36 +462,29 @@ class AdvancedAnalyzer:
                 'volume': coin_data['total_volume'],
                 'volume_ratio': coin_data['total_volume'] / coin_data['market_cap'] if coin_data['market_cap'] > 0 else 0,
                 'analysis': analysis,
-                'recommendation': self.get_recommendation(score, analysis)
+                'technical_indicators': indicators,
+                'timestamp': datetime.now()
             }
-        return None
-    
-    def get_recommendation(self, score, analysis):
-        """Генерирует рекомендацию на основе счета"""
-        if score >= 80:
-            return "🚀 СИЛЬНЫЙ СИГНАЛ - Высокий потенциал роста"
-        elif score >= 65:
-            return "📈 ХОРОШИЙ СИГНАЛ - Умеренный потенциал"
-        elif score >= 50:
-            return "💡 СРЕДНИЙ СИГНАЛ - Требует осторожности"
-        else:
-            return "⚠️ СЛАБЫЙ СИГНАЛ - Высокий риск"
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка анализа монеты {coin_data.get('symbol', 'unknown')}: {e}")
+            return None
 
-class CryptoFinalBot:
-    def __init__(self):
-        self.token = "8406686288:AAHSHNwi_ocevorBddn5P_6Oc70aMx0-Usc"
-        self.chat_id = "6823451625"
-        self.base_url = f"https://api.telegram.org/bot{self.token}"
-        self.analyzer = AdvancedAnalyzer()
-        self.last_update_id = 0
+class CryptoAdvancedBot:
+    """Продвинутый крипто-бот"""
+    
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{token}"
+        self.db = DatabaseManager()
         self.is_processing = False
-        self.user_states = {}
         self.last_manual_update = 0
         self.cached_predictions = None
         self.last_successful_update = None
     
-    def send_message(self, text, reply_markup=None):
-        """Отправка сообщения в Telegram"""
+    async def send_message(self, text: str, reply_markup: Dict = None) -> bool:
+        """Асинхронная отправка сообщения"""
         if self.is_processing:
             return False
             
@@ -322,332 +501,62 @@ class CryptoFinalBot:
             payload['reply_markup'] = reply_markup
             
         try:
-            response = requests.post(url, json=payload, timeout=10)
-            if response.status_code == 200:
-                logging.info("✅ Сообщение отправлено")
-                return True
-            else:
-                logging.error(f"❌ Ошибка отправки: {response.status_code}")
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=10) as response:
+                    if response.status == 200:
+                        logger.info("✅ Сообщение отправлено")
+                        return True
+                    else:
+                        logger.error(f"❌ Ошибка отправки: {response.status}")
         except Exception as e:
-            logging.error(f"❌ Ошибка отправки: {e}")
+            logger.error(f"❌ Ошибка отправки: {e}")
         finally:
             self.is_processing = False
         return False
     
-    def create_reply_keyboard(self):
-        """Создает постоянное меню внизу экрана"""
-        return {
-            'keyboard': [
-                ['🏆 ТОП 10', '🔄 ОБНОВИТЬ'],
-                ['🔍 АНАЛИЗ МОНЕТЫ', '🚀 СИГНАЛЫ'],
-                ['📰 КРИПТО-НОВОСТИ', '❓ ПОМОЩЬ']
-            ],
-            'resize_keyboard': True,
-            'one_time_keyboard': False
-        }
-    
-    def create_signal_keyboard(self, symbol):
-        """Создает кнопки для сигналов"""
+    def create_signal_keyboard(self, symbol: str, signal_id: int) -> Dict:
+        """Создает кнопки для сигналов с ID"""
         return {
             'inline_keyboard': [
                 [
-                    {'text': '✅ СРАБОТАЛ', 'callback_data': f'success_{symbol}'},
-                    {'text': '❌ НЕ СРАБОТАЛ', 'callback_data': f'fail_{symbol}'}
+                    {'text': '✅ СРАБОТАЛ', 'callback_data': f'success_{signal_id}_{symbol}'},
+                    {'text': '❌ НЕ СРАБОТАЛ', 'callback_data': f'fail_{signal_id}_{symbol}'}
                 ],
                 [
-                    {'text': '💡 ЧАСТИЧНО', 'callback_data': f'partial_{symbol}'}
+                    {'text': '💡 ЧАСТИЧНО', 'callback_data': f'partial_{signal_id}_{symbol}'}
                 ]
             ]
         }
     
-    def format_news_alert(self, news_item):
-        """Форматирует новостной алерт"""
-        coins_text = ", ".join(news_item['coins'])
-        
-        message = f"""
-📰 <b>НОВОСТНОЙ АЛЕРТ!</b>
-
-🏷️ <b>Заголовок:</b> {news_item['title']}
-📝 <b>Описание:</b> {news_item['description']}
-💰 <b>Упоминания:</b> {coins_text}
-
-🔗 <a href="{news_item['url']}">Читать полностью</a>
-
-💡 <i>Проверьте упомянутые монеты!</i>
-"""
-        return message
-    
-    def format_top_predictions(self, predictions, show_cache_info=False, update_time=None):
-        """Форматирует топ предсказаний"""
-        if not predictions:
-            return "📊 <b>ТОП 10 ПЕРСПЕКТИВНЫХ МОНЕТ</b>\n\nНа данный момент нет данных для анализа. Попробуйте позже."
-        
-        message = "🏆 <b>ТОП 10 ПЕРСПЕКТИВНЫХ МОНЕТ</b>\n\n"
-        
-        for i, coin in enumerate(predictions, 1):
-            emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-            
-            # Форматируем цену
-            price = coin['price']
-            if price is None:
-                price_str = "N/A"
-            elif price < 0.001:
-                price_str = f"${price:.8f}"
-            elif price < 1:
-                price_str = f"${price:.6f}"
-            else:
-                price_str = f"${price:.2f}"
-            
-            message += f"{emoji} <b>{coin['symbol']}</b> - Score: {coin['score']}%\n"
-            message += f"   💰 {price_str} | 📈 {coin['price_change_24h']:.1f}%\n"
-            
-            # Получаем первый анализ для отображения
-            if coin['analysis']:
-                main_reason = list(coin['analysis'].values())[0]
-                message += f"   🔍 {main_reason}\n"
-            else:
-                message += f"   🔍 Нет данных анализа\n"
-            
-            message += "\n"
-        
-        if show_cache_info and update_time:
-            time_diff = datetime.now() - update_time
-            minutes_ago = int(time_diff.total_seconds() / 60)
-            message += f"💾 <i>Данные актуальны на {update_time.strftime('%H:%M:%S')} ({minutes_ago} мин. назад)</i>\n"
-        else:
-            message += "⚡ <i>Данные обновлены только что</i>\n"
-            
-        message += "🔄 <i>Авто-обновление каждые 5 минут</i>"
-        return message
-    
-    def format_coin_analysis(self, analysis):
-        """Форматирует детальный анализ монеты"""
-        if not analysis:
-            return "❌ Монета не найдена. Проверьте символ (например: BTC, ETH, SOL, NEAR)"
-        
-        # Форматируем цену
-        price = analysis['price']
-        if price is None:
-            price_str = "N/A"
-        elif price < 0.001:
-            price_str = f"${price:.8f}"
-        elif price < 1:
-            price_str = f"${price:.6f}"
-        else:
-            price_str = f"${price:.2f}"
-        
-        message = f"""
-🔍 <b>ДЕТАЛЬНЫЙ АНАЛИЗ - {analysis['symbol']}</b>
-
-🏷️ <b>Название:</b> {analysis['name']}
-🎯 <b>Общий счет:</b> {analysis['score']}/100
-💰 <b>Цена:</b> {price_str}
-📊 <b>Изменение 24ч:</b> {analysis['price_change_24h']:.1f}%
-🏦 <b>Капитализация:</b> ${analysis['market_cap']:,.0f}
-📈 <b>Объем/Капа:</b> {analysis['volume_ratio']:.2%}
-
-<b>АНАЛИЗ МЕТРИК:</b>
-"""
-        if analysis['analysis']:
-            for metric, desc in analysis['analysis'].items():
-                message += f"• {desc}\n"
-        else:
-            message += "• Нет данных анализа\n"
-        
-        message += f"\n<b>РЕКОМЕНДАЦИЯ:</b>\n{analysis['recommendation']}"
-        return message
-    
-    def format_statistics(self):
-        """Форматирует общую статистику"""
-        message = """
-📊 <b>СТАТИСТИКА СИСТЕМЫ</b>
-
-<b>📈 АНАЛИЗИРУЕТ:</b>
-• Топ-100 криптовалют
-• Volume/Market Cap соотношения
-• Price momentum и тренды
-• Крипто-новости и алерты
-
-<b>🎯 КРИТЕРИИ ОТБОРА:</b>
-• Малая капитализация (<$50M)
-• Высокий объем торгов
-• Умеренный рост (5-50%)
-• Упоминания в новостях
-
-<b>🚀 ВОЗМОЖНОСТИ:</b>
-• Авто-сигналы каждые 5 минут
-• Ручной анализ любой монеты
-• Новостные алерты
-• Топ 10 перспективных активов
-
-⚡ <i>Система постоянно улучшается!</i>
-"""
-        return message
-    
-    def format_help(self):
-        """Форматирует помощь"""
-        help_text = """
-❓ <b>ПОМОЩЬ ПО СИСТЕМЕ</b>
-
-<b>🏆 ТОП 10</b> - Лучшие монеты по потенциалу роста
-<b>🔄 ОБНОВИТЬ</b> - Принудительное обновление данных (раз в 30 сек)
-<b>🔍 АНАЛИЗ МОНЕТЫ</b> - Детальный анализ по символу
-<b>🚀 СИГНАЛЫ</b> - Активные торговые сигналы
-<b>📰 КРИПТО-НОВОСТИ</b> - Свежие новости с упоминаниями монет
-
-<b>📈 КАК ИСПОЛЬЗОВАТЬ:</b>
-1. Используйте меню для навигации
-2. Для анализа введите символ монеты
-3. Отмечайте результаты сигналов
-4. Следите за новостными алерами
-
-<b>💡 ПРИМЕРЫ СИМВОЛОВ:</b>
-BTC, ETH, SOL, ADA, DOT, MATIC, AVAX, NEAR
-
-⚡ <i>Бот работает 24/7 и постоянно анализирует рынок!</i>
-"""
-        return help_text
-    
-    def handle_manual_update(self):
-        """Обрабатывает ручное обновление с таймером"""
-        current_time = time.time()
-        time_since_last = current_time - self.last_manual_update
-        
-        if time_since_last < 30:
-            seconds_left = 30 - int(time_since_last)
-            return f"⏰ Обновить можно через {seconds_left} сек."
-        else:
-            self.last_manual_update = current_time
-            return self.show_top_predictions(force_update=True)
-    
-    def show_top_predictions(self, force_update=False):
-        """Показывает топ 10 монет"""
-        # Если есть кеш и не принудительное обновление - используем кеш
-        if self.cached_predictions and not force_update:
-            message = self.format_top_predictions(
-                self.cached_predictions, 
-                show_cache_info=True,
-                update_time=self.last_successful_update
-            )
-            keyboard = self.create_reply_keyboard()
-            self.send_message(message, keyboard)
-            return
-        
-        logging.info("🔄 Получение данных для ТОП 10...")
-        coins_data = self.analyzer.fetch_top_coins()
-        if coins_data:
-            logging.info(f"📊 Найдено {len(coins_data)} монет для анализа")
-            predictions = self.analyzer.get_top_predictions(coins_data, 10)
-            self.cached_predictions = predictions
-            self.last_successful_update = datetime.now()
-            message = self.format_top_predictions(predictions)
-            if force_update:
-                message = message.replace("Данные обновлены только что", "✅ <b>Данные обновлены!</b>")
-            keyboard = self.create_reply_keyboard()
-            self.send_message(message, keyboard)
-        else:
-            # Если API недоступно, показываем кеш или ошибку
-            if self.cached_predictions:
-                message = self.format_top_predictions(
-                    self.cached_predictions,
-                    show_cache_info=True,
-                    update_time=self.last_successful_update
-                )
-                message += "\n\n⚠️ <i>API временно недоступно. Показаны последние сохраненные данные</i>"
-                keyboard = self.create_reply_keyboard()
-                self.send_message(message, keyboard)
-            else:
-                self.send_message("❌ Не удалось получить данные с CoinGecko. Попробуйте позже.", self.create_reply_keyboard())
-    
-    def show_statistics(self):
-        """Показывает статистику"""
-        message = self.format_statistics()
-        keyboard = self.create_reply_keyboard()
-        self.send_message(message, keyboard)
-    
-    def show_help(self):
-        """Показывает помощь"""
-        message = self.format_help()
-        keyboard = self.create_reply_keyboard()
-        self.send_message(message, keyboard)
-    
-    def show_crypto_news(self):
-        """Показывает последние крипто-новости"""
-        news_items = self.analyzer.news_monitor.get_crypto_news()
-        
-        if not news_items:
-            message = "📰 <b>ПОСЛЕДНИЕ НОВОСТИ</b>\n\nНа данный момент новостей нет. Проверка каждые 10 минут! 🔄"
-            keyboard = self.create_reply_keyboard()
-            self.send_message(message, keyboard)
-            return
-        
-        for news in news_items[:3]:
-            message = self.format_news_alert(news)
-            keyboard = self.create_reply_keyboard()
-            self.send_message(message, keyboard)
-            time.sleep(1)
-    
-    def ask_for_coin_symbol(self):
-        """Просит ввести символ монеты"""
-        message = """
-🔍 <b>АНАЛИЗ МОНЕТЫ</b>
-
-Введите символ монеты для анализа:
-• <b>Примеры:</b> BTC, ETH, SOL, ADA, DOT
-• <b>Или:</b> MATIC, AVAX, NEAR, APT, ARB
-• <b>Или ЛЮБАЯ другая монета!</b>
-
-📊 <i>Я проанализирую:
-- Volume/Market Cap соотношение
-- Price momentum и тренды
-- Потенциал роста и риски
-- Общий scoring (0-100)</i>
-
-💡 <b>Введите символ сейчас:</b>
-"""
-        keyboard = self.create_reply_keyboard()
-        self.send_message(message, keyboard)
-    
-    def analyze_coin_by_symbol(self, symbol):
-        """Анализирует монету по символу"""
-        logging.info(f"🔍 Анализ монеты: {symbol}")
-        analysis = self.analyzer.get_coin_analysis(symbol)
-        message = self.format_coin_analysis(analysis)
-        keyboard = self.create_reply_keyboard()
-        self.send_message(message, keyboard)
-    
-    def show_active_signals(self):
-        """Показывает активные сигналы"""
-        message = """
-🚀 <b>АКТИВНЫЕ СИГНАЛЫ</b>
-
-Сигналы появляются здесь автоматически при обнаружении перспективных монет!
-
-<b>📈 СИГНАЛЫ ВКЛЮЧАЮТ:</b>
-• Монеты с scoring > 60%
-• Высокий объем при низкой капе
-• Умеренный рост с потенциалом
-• Упоминания в новостях
-
-<b>⏰ ЧАСТОТА СИГНАЛОВ:</b>
-• Авто-проверка каждые 5 минут
-• Новостные алерты каждые 10 минут
-• Только качественные setup
-
-⚡ <i>Следующая проверка через 5 минут...</i>
-"""
-        keyboard = self.create_reply_keyboard()
-        self.send_message(message, keyboard)
-    
-    def send_signal(self, coin, score, analysis):
+    async def send_signal(self, analysis: Dict) -> bool:
         """Отправляет торговый сигнал"""
-        symbol = coin['symbol'].upper()
+        symbol = analysis['symbol']
+        
+        # Сохраняем сигнал в БД
+        signal_id = await self.db.save_signal(
+            symbol=symbol,
+            score=analysis['score'],
+            price=analysis['price'],
+            signal_type="AUTO",
+            analysis=analysis['analysis']
+        )
+        
+        if not signal_id:
+            return False
+        
+        # Форматируем сообщение
+        message = await self.format_signal_message(analysis)
+        keyboard = self.create_signal_keyboard(symbol, signal_id)
+        
+        return await self.send_message(message, keyboard)
+    
+    async def format_signal_message(self, analysis: Dict) -> str:
+        """Форматирует сообщение сигнала"""
+        symbol = analysis['symbol']
+        price = analysis['price']
         
         # Форматируем цену
-        price = coin['current_price']
-        if price is None:
-            price_str = "N/A"
-        elif price < 0.001:
+        if price < 0.001:
             price_str = f"${price:.8f}"
         elif price < 1:
             price_str = f"${price:.6f}"
@@ -657,168 +566,138 @@ BTC, ETH, SOL, ADA, DOT, MATIC, AVAX, NEAR
         message = f"""
 🎯 <b>СИГНАЛ - {symbol}</b>
 
-⭐ <b>Score:</b> {score}/100
+⭐ <b>Score:</b> {analysis['score']}/100
 💰 <b>Цена:</b> {price_str}
-📊 <b>Изменение 24ч:</b> {coin.get('price_change_percentage_24h', 0):.1f}%
+📊 <b>Изменение 24ч:</b> {analysis['price_change_24h']:.1f}%
+🏦 <b>Капитализация:</b> ${analysis['market_cap']:,.0f}
 
-<b>ОСНОВНЫЕ ПРИЧИНЫ:</b>
+<b>ТЕХНИЧЕСКИЙ АНАЛИЗ:</b>
 """
-        if analysis:
-            for reason in list(analysis.values())[:3]:
-                message += f"• {reason}\n"
-        else:
-            message += "• Нет данных анализа\n"
         
-        message += "\n💡 <i>Отметь результат для обучения системы!</i>"
+        for metric, desc in analysis['analysis'].items():
+            message += f"• {desc}\n"
         
-        keyboard = self.create_signal_keyboard(symbol)
-        return self.send_message(message, keyboard)
+        # Добавляем ML информацию
+        if 'ml' in analysis['analysis']:
+            message += f"\n<b>ML ПРОГНОЗ:</b>\n"
+            message += f"• {analysis['analysis']['ml']}\n"
+        
+        message += f"\n💡 <i>Отметь результат для обучения системы!</i>"
+        
+        return message
     
-    def send_news_alerts(self):
-        """Отправляет новостные алерты"""
-        new_news = self.analyzer.news_monitor.check_new_news()
-        
-        for news in new_news:
-            message = self.format_news_alert(news)
-            keyboard = self.create_reply_keyboard()
-            self.send_message(message, keyboard)
-            time.sleep(1)
-    
-    def check_updates(self):
-        """Проверяет обновления от Telegram"""
+    async def process_feedback(self, callback_data: str):
+        """Обрабатывает фидбек пользователя"""
         try:
-            url = f"{self.base_url}/getUpdates"
-            params = {'offset': self.last_update_id + 1, 'timeout': 5}
-            response = requests.get(url, params=params, timeout=10)
-            
-            if response.status_code == 200:
-                updates = response.json().get('result', [])
+            parts = callback_data.split('_')
+            if len(parts) >= 3:
+                feedback_type = parts[0]
+                signal_id = int(parts[1])
+                symbol = parts[2]
                 
-                for update in updates:
-                    self.last_update_id = update['update_id']
-                    
-                    if 'message' in update:
-                        self.handle_message(update['message'])
-                    elif 'callback_query' in update:
-                        self.handle_callback(update['callback_query'])
-                        
-        except Exception as e:
-            logging.error(f"❌ Ошибка проверки обновлений: {e}")
-    
-    def handle_message(self, message):
-        """Обрабатывает текстовые сообщения"""
-        if 'text' not in message:
-            return
-        
-        text = message['text'].strip()
-        logging.info(f"📨 Получено сообщение: {text}")
-        
-        # Обработка команд меню
-        if text == '🏆 ТОП 10':
-            self.show_top_predictions()
-        elif text == '🔄 ОБНОВИТЬ':
-            result = self.handle_manual_update()
-            if isinstance(result, str):
-                self.send_message(result, self.create_reply_keyboard())
-        elif text == '📊 СТАТИСТИКА':
-            self.show_statistics()
-        elif text == '🔍 АНАЛИЗ МОНЕТЫ':
-            self.ask_for_coin_symbol()
-        elif text == '🚀 СИГНАЛЫ':
-            self.show_active_signals()
-        elif text == '📰 КРИПТО-НОВОСТИ':
-            self.show_crypto_news()
-        elif text == '❓ ПОМОЩЬ':
-            self.show_help()
-        else:
-            # Предполагаем что это символ монеты (3-10 символов, только буквы/цифры)
-            if 2 <= len(text) <= 10 and text.replace(' ', '').isalnum():
-                self.analyze_coin_by_symbol(text)
-            else:
-                self.send_message("❌ Неизвестная команда. Используйте меню ниже.", self.create_reply_keyboard())
-    
-    def handle_callback(self, callback_query):
-        """Обрабатывает callback запросы"""
-        try:
-            callback_data = callback_query['data']
-            message = callback_query['message']
-            
-            logging.info(f"🔘 Нажата кнопка: {callback_data}")
-            
-            if callback_data.startswith('success_'):
-                symbol = callback_data.replace('success_', '')
-                self.send_message(f"✅ <b>ФИДБЕК ЗАПИСАН!</b>\n\n{symbol} - СРАБОТАЛ\n\nСпасибо! Система учится 🧠", self.create_reply_keyboard())
-            elif callback_data.startswith('fail_'):
-                symbol = callback_data.replace('fail_', '')
-                self.send_message(f"✅ <b>ФИДБЕК ЗАПИСАН!</b>\n\n{symbol} - НЕ СРАБОТАЛ\n\nСпасибо! Система учится 🧠", self.create_reply_keyboard())
-            elif callback_data.startswith('partial_'):
-                symbol = callback_data.replace('partial_', '')
-                self.send_message(f"✅ <b>ФИДБЕК ЗАПИСАН!</b>\n\n{symbol} - ЧАСТИЧНО\n\nСпасибо! Система учится 🧠", self.create_reply_keyboard())
+                await self.db.save_feedback(signal_id, symbol, feedback_type)
+                
+                response_text = f"""
+✅ <b>ФИДБЕК ЗАПИСАН!</b>
+
+{symbol} - {feedback_type.upper()}
+
+Спасибо! Система учится на ваших оценках 🧠
+
+<b>Статистика фидбека:</b>
+• Успешные: {await self.get_feedback_stats('success')}
+• Неудачные: {await self.get_feedback_stats('fail')}  
+• Частичные: {await self.get_feedback_stats('partial')}
+"""
+                await self.send_message(response_text)
                 
         except Exception as e:
-            logging.error(f"❌ Ошибка обработки callback: {e}")
+            logger.error(f"❌ Ошибка обработки фидбека: {e}")
     
-    def send_welcome(self):
-        """Отправляет приветственное сообщение"""
-        welcome_text = """
-🤖 <b>ПРОДВИНУТАЯ СИСТЕМА АНАЛИЗА КРИПТО</b>
-
-🚀 <b>СИСТЕМА ЗАПУЩЕНА</b>
-
-📊 <b>АНАЛИЗИРУЕТ:</b>
-• Топ-100 криптовалют
-• Volume/Market Cap соотношения
-• Price momentum и тренды
-• Крипто-новости в реальном времени
-
-🎯 <b>ВОЗМОЖНОСТИ:</b>
-• 🏆 Топ 10 перспективных монет
-• 🔍 Детальный анализ любой монеты
-• 📰 Новостные алерты с упоминаниями
-• 🚀 Авто-сигналы
-
-⚡ <b>Используйте меню ниже для навигации!</b>
-"""
-        keyboard = self.create_reply_keyboard()
-        self.send_message(welcome_text, keyboard)
-
-def main():
-    logging.info("🚀 Запуск ФИНАЛЬНОЙ версии бота с новостями...")
+    async def get_feedback_stats(self, feedback_type: str) -> int:
+        """Получает статистику фидбека"""
+        try:
+            with sqlite3.connect(self.db.db_path) as conn:
+                cursor = conn.execute(
+                    'SELECT COUNT(*) FROM feedback WHERE feedback_type = ?',
+                    (feedback_type,)
+                )
+                return cursor.fetchone()[0]
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения статистики: {e}")
+            return 0
     
-    bot = CryptoFinalBot()
+    async def run_analysis_cycle(self):
+        """Запускает цикл анализа"""
+        logger.info("🔄 Запуск цикла анализа...")
+        
+        async with AdvancedAnalyzer(self.db) as analyzer:
+            coins_data = await analyzer.fetch_top_coins(100)
+            
+            if not coins_data:
+                logger.warning("⚠️ Не удалось получить данные монет")
+                return
+            
+            # Анализируем все монеты
+            analyses = []
+            for coin in coins_data:
+                analysis = await analyzer.analyze_coin(coin)
+                if analysis and analysis['score'] >= 60:  # Минимальный порог
+                    analyses.append(analysis)
+            
+            # Сортируем по score
+            analyses.sort(key=lambda x: x['score'], reverse=True)
+            self.cached_predictions = analyses[:10]
+            self.last_successful_update = datetime.now()
+            
+            # Отправляем топ-3 сигнала
+            for analysis in analyses[:3]:
+                if analysis['score'] >= 75:  # Высокий порог для сигналов
+                    await self.send_signal(analysis)
+                    await asyncio.sleep(1)  # Задержка между сообщениями
+            
+            logger.info(f"✅ Анализ завершен. Найдено {len(analyses)} перспективных монет")
+
+async def main():
+    """Основная функция"""
+    # Конфигурация
+    BOT_TOKEN = "8406686288:AAHSHNwi_ocevorBddn5P_6Oc70aMx0-Usc"
+    CHAT_ID = "6823451625"
     
-    # Запуск обработки обновлений
-    def updates_worker():
-        while True:
-            try:
-                bot.check_updates()
-                time.sleep(1)
-            except Exception as e:
-                logging.error(f"❌ Ошибка в updates_worker: {e}")
-                time.sleep(5)
-    
-    updates_thread = Thread(target=updates_worker, daemon=True)
-    updates_thread.start()
+    bot = CryptoAdvancedBot(BOT_TOKEN, CHAT_ID)
     
     # Приветственное сообщение
-    time.sleep(2)
-    bot.send_welcome()
+    await bot.send_message("""
+🤖 <b>ПРОДВИНУТАЯ СИСТЕМА АНАЛИЗА КРИПТО ЗАПУЩЕНА</b>
+
+🚀 <b>НОВЫЕ ВОЗМОЖНОСТИ:</b>
+• 🤖 ML-прогнозирование
+• 📊 Технические индикаторы (RSI, MACD, EMA)
+• 🧠 Обучение на фидбеке
+• 💾 Сохранение истории в БД
+• ⚡ Асинхронная обработка
+
+📈 <b>СИСТЕМА АНАЛИЗИРУЕТ:</b>
+• Топ-100 криптовалют
+• Volume/Market Cap соотношения  
+• Технические индикаторы
+• ML-прогнозы роста
+• Новостные упоминания
+
+⚡ <i>Авто-обновление каждые 15 минут</i>
+""")
     
-    last_news_check = time.time()
-    last_analysis_check = time.time()
-    
-    # Основной цикл анализа
+    # Основной цикл
     while True:
         try:
-            current_time = time.time()
-            logging.info(f"\n[{datetime.now().strftime('%H:%M:%S')}] Анализ рынка...")
+            await bot.run_analysis_cycle()
+            logger.info("💤 Ожидание следующего цикла анализа (15 минут)...")
+            await asyncio.sleep(15 * 60)  # 15 минут
             
-            # Загружаем и анализируем монеты каждые 5 минут
-            if current_time - last_analysis_check > CONFIG['interval']:
-                coins_data = bot.analyzer.fetch_top_coins()
-                if coins_data:
-                    logging.info(f"📊 Проанализировано {len(coins_data)} монет")
-                    # Обновляем кеш при авто-обновлении
-                    top_predictions = bot.analyzer.get_top_predictions(coins_data, 10)
-                    bot.cached_predictions = top_predictions
-                    bot.last
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка в основном цикле: {e}")
+            await asyncio.sleep(60)  # Ждем минуту перед повторной попыткой
+
+if __name__ == "__main__":
+    # Запуск бота
+    asyncio.run(main())
