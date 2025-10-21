@@ -5,18 +5,36 @@ import sqlite3
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set, Any
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import json
-import hashlib
+import time
+import os
+from enum import Enum
+import statistics
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('crypto_bot.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
+
+class DiscoverySource(Enum):
+    TOP_MARKET_CAP = "top_market_cap"
+    VOLUME_SCREENER = "volume_screener"
+    NEW_COINS_SEARCH = "new_coins_search"
+
+class SignalStatus(Enum):
+    ACTIVE = "active"
+    SUCCESS = "success"
+    FAIL = "fail"
+    PARTIAL = "partial"
 
 @dataclass
 class CoinData:
@@ -29,6 +47,8 @@ class CoinData:
     price_change_24h: float
     price_change_7d: float
     timestamp: datetime
+    is_new: bool = False
+    discovery_source: str = DiscoverySource.TOP_MARKET_CAP.value
 
 @dataclass
 class TechnicalIndicators:
@@ -42,25 +62,43 @@ class TechnicalIndicators:
     macd_histogram: float = 0
     volume_sma: float = 0
 
+@dataclass
+class SignalData:
+    """Данные сигнала"""
+    symbol: str
+    score: int
+    price: float
+    signal_type: str
+    analysis: Dict[str, str]
+    timestamp: datetime
+    discovery_source: str
+    is_new: bool = False
+    bonus_applied: int = 0
+    status: str = SignalStatus.ACTIVE.value
+
 class DatabaseManager:
-    """Менеджер базы данных"""
+    """Менеджер базы данных для хранения истории"""
     
-    def __init__(self, db_path: str = "crypto_bot.db"):
+    def __init__(self, db_path: str = "crypto_bot_advanced.db"):
         self.db_path = db_path
         self.init_database()
     
     def init_database(self):
         """Инициализация таблиц БД"""
         with sqlite3.connect(self.db_path) as conn:
-            # Таблица исторических данных
+            # Таблица исторических данных монет
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS coin_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
+                    name TEXT NOT NULL,
                     price REAL NOT NULL,
                     market_cap REAL NOT NULL,
                     volume_24h REAL NOT NULL,
                     price_change_24h REAL NOT NULL,
+                    price_change_7d REAL NOT NULL,
+                    is_new BOOLEAN DEFAULT FALSE,
+                    discovery_source TEXT NOT NULL,
                     timestamp DATETIME NOT NULL,
                     UNIQUE(symbol, timestamp)
                 )
@@ -75,8 +113,12 @@ class DatabaseManager:
                     price REAL NOT NULL,
                     signal_type TEXT NOT NULL,
                     analysis TEXT NOT NULL,
+                    discovery_source TEXT NOT NULL,
+                    is_new BOOLEAN DEFAULT FALSE,
+                    bonus_applied INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'active',
                     timestamp DATETIME NOT NULL,
-                    is_active BOOLEAN DEFAULT TRUE
+                    feedback_timestamp DATETIME
                 )
             ''')
             
@@ -84,10 +126,11 @@ class DatabaseManager:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS feedback (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    signal_id INTEGER,
+                    signal_id INTEGER NOT NULL,
                     symbol TEXT NOT NULL,
                     feedback_type TEXT NOT NULL,
                     user_comment TEXT,
+                    original_score INTEGER NOT NULL,
                     timestamp DATETIME NOT NULL,
                     FOREIGN KEY(signal_id) REFERENCES signals(id)
                 )
@@ -111,6 +154,19 @@ class DatabaseManager:
                 )
             ''')
             
+            # Таблица статистики моделей
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS model_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_type TEXT NOT NULL,
+                    parameters TEXT NOT NULL,
+                    accuracy REAL,
+                    total_signals INTEGER,
+                    successful_signals INTEGER,
+                    timestamp DATETIME NOT NULL
+                )
+            ''')
+            
             conn.commit()
     
     async def save_coin_data(self, coin_data: CoinData):
@@ -119,15 +175,130 @@ class DatabaseManager:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute('''
                     INSERT OR REPLACE INTO coin_history 
-                    (symbol, price, market_cap, volume_24h, price_change_24h, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (symbol, name, price, market_cap, volume_24h, price_change_24h, 
+                     price_change_7d, is_new, discovery_source, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    coin_data.symbol, coin_data.price, coin_data.market_cap,
-                    coin_data.volume_24h, coin_data.price_change_24h, coin_data.timestamp
+                    coin_data.symbol, coin_data.name, coin_data.price, coin_data.market_cap,
+                    coin_data.volume_24h, coin_data.price_change_24h, coin_data.price_change_7d,
+                    coin_data.is_new, coin_data.discovery_source, coin_data.timestamp
                 ))
                 conn.commit()
         except Exception as e:
-            logger.error(f"Ошибка сохранения данных монеты: {e}")
+            logger.error(f"❌ Ошибка сохранения данных монеты: {e}")
+    
+    async def save_signal(self, signal_data: SignalData) -> int:
+        """Сохраняет сигнал в БД и возвращает ID"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute('''
+                    INSERT INTO signals 
+                    (symbol, score, price, signal_type, analysis, discovery_source, 
+                     is_new, bonus_applied, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    signal_data.symbol, signal_data.score, signal_data.price,
+                    signal_data.signal_type, json.dumps(signal_data.analysis),
+                    signal_data.discovery_source, signal_data.is_new,
+                    signal_data.bonus_applied, signal_data.timestamp
+                ))
+                conn.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения сигнала: {e}")
+            return -1
+    
+    async def save_feedback(self, signal_id: int, symbol: str, feedback_type: str, 
+                          original_score: int, comment: str = ""):
+        """Сохраняет фидбек пользователя и обновляет статус сигнала"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Сохраняем фидбек
+                conn.execute('''
+                    INSERT INTO feedback 
+                    (signal_id, symbol, feedback_type, user_comment, original_score, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (signal_id, symbol, feedback_type, comment, original_score, datetime.now()))
+                
+                # Обновляем статус сигнала
+                conn.execute('''
+                    UPDATE signals SET status = ?, feedback_timestamp = ? 
+                    WHERE id = ?
+                ''', (feedback_type, datetime.now(), signal_id))
+                
+                conn.commit()
+                logger.info(f"✅ Фидбек сохранен: {symbol} - {feedback_type}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения фидбека: {e}")
+    
+    async def get_signal_stats(self, days: int = 90) -> Dict[str, Any]:
+        """Получает статистику сигналов за указанный период"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                since_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+                
+                # Общая статистика
+                cursor = conn.execute('''
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success,
+                        SUM(CASE WHEN status = 'fail' THEN 1 ELSE 0 END) as fail,
+                        SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END) as partial,
+                        AVG(score) as avg_score
+                    FROM signals 
+                    WHERE timestamp >= ? AND status != 'active'
+                ''', (since_date,))
+                
+                stats = cursor.fetchone()
+                
+                # Статистика по источникам
+                source_cursor = conn.execute('''
+                    SELECT 
+                        discovery_source,
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success
+                    FROM signals 
+                    WHERE timestamp >= ? AND status != 'active'
+                    GROUP BY discovery_source
+                ''', (since_date,))
+                
+                source_stats = {}
+                for row in source_cursor:
+                    source_stats[row[0]] = {
+                        'total': row[1],
+                        'success': row[2],
+                        'success_rate': (row[2] / row[1]) * 100 if row[1] > 0 else 0
+                    }
+                
+                # Статистика по новым монетам
+                new_coins_cursor = conn.execute('''
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success
+                    FROM signals 
+                    WHERE timestamp >= ? AND is_new = TRUE AND status != 'active'
+                ''', (since_date,))
+                
+                new_coins_stats = new_coins_cursor.fetchone()
+                
+                return {
+                    'total_signals': stats[0],
+                    'successful_signals': stats[1],
+                    'failed_signals': stats[2],
+                    'partial_signals': stats[3],
+                    'success_rate': (stats[1] / stats[0]) * 100 if stats[0] > 0 else 0,
+                    'average_score': stats[4],
+                    'source_stats': source_stats,
+                    'new_coins_stats': {
+                        'total': new_coins_stats[0],
+                        'success': new_coins_stats[1],
+                        'success_rate': (new_coins_stats[1] / new_coins_stats[0]) * 100 if new_coins_stats[0] > 0 else 0
+                    }
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения статистики: {e}")
+            return {}
     
     async def get_historical_data(self, symbol: str, days: int = 30) -> pd.DataFrame:
         """Получает исторические данные для расчета индикаторов"""
@@ -141,44 +312,45 @@ class DatabaseManager:
                 ''', conn, params=(symbol, f'-{days} days'))
                 return df
         except Exception as e:
-            logger.error(f"Ошибка получения исторических данных: {e}")
+            logger.error(f"❌ Ошибка получения исторических данных: {e}")
             return pd.DataFrame()
+
+class PotentialCoinsCache:
+    """Кэш для перспективных монет"""
     
-    async def save_signal(self, symbol: str, score: int, price: float, 
-                         signal_type: str, analysis: dict):
-        """Сохраняет сигнал в БД"""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute('''
-                    INSERT INTO signals 
-                    (symbol, score, price, signal_type, analysis, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (symbol, score, price, signal_type, json.dumps(analysis), datetime.now()))
-                conn.commit()
-                return cursor.lastrowid
-        except Exception as e:
-            logger.error(f"Ошибка сохранения сигнала: {e}")
-            return None
+    def __init__(self, cache_file: str = "potential_coins_cache.json"):
+        self.cache_file = cache_file
+        self.cache_duration = 6 * 3600  # 6 часов
     
-    async def save_feedback(self, signal_id: int, symbol: str, 
-                          feedback_type: str, comment: str = ""):
-        """Сохраняет фидбек пользователя"""
+    def load_cache(self) -> Optional[List[Dict]]:
+        """Загружает кэш из файла"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute('''
-                    INSERT INTO feedback 
-                    (signal_id, symbol, feedback_type, user_comment, timestamp)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (signal_id, symbol, feedback_type, comment, datetime.now()))
-                
-                # Деактивируем сигнал после фидбека
-                conn.execute('''
-                    UPDATE signals SET is_active = FALSE WHERE id = ?
-                ''', (signal_id,))
-                
-                conn.commit()
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    cache_data = json.load(f)
+                    # Проверяем актуальность кэша
+                    cache_time = datetime.fromisoformat(cache_data['timestamp'])
+                    if (datetime.now() - cache_time).total_seconds() < self.cache_duration:
+                        logger.info(f"✅ Используем кэшированные данные: {len(cache_data['coins'])} монет")
+                        return cache_data['coins']
+                    else:
+                        logger.info("⚠️ Кэш устарел, требуется обновление")
         except Exception as e:
-            logger.error(f"Ошибка сохранения фидбека: {e}")
+            logger.error(f"❌ Ошибка загрузки кэша: {e}")
+        return None
+    
+    def save_cache(self, coins: List[Dict]):
+        """Сохраняет кэш в файл"""
+        try:
+            cache_data = {
+                'timestamp': datetime.now().isoformat(),
+                'coins': coins
+            }
+            with open(self.cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, indent=2, ensure_ascii=False)
+            logger.info(f"✅ Кэш сохранен: {len(coins)} монет")
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения кэша: {e}")
 
 class TechnicalAnalyzer:
     """Анализатор технических индикаторов"""
@@ -229,10 +401,19 @@ class TechnicalAnalyzer:
         macd = ema_12 - ema_26
         
         # Сигнальная линия (EMA от MACD)
-        macd_values = [ema_12 - ema_26 for ema_12, ema_26 in 
-                      zip(pd.Series(prices).ewm(span=12).mean(),
-                          pd.Series(prices).ewm(span=26).mean())]
-        signal = pd.Series(macd_values).ewm(span=9).mean().iloc[-1]
+        macd_values = []
+        for i in range(len(prices)):
+            if i >= 25:
+                price_window = prices[i-25:i+1]
+                ema_12_val = TechnicalAnalyzer.calculate_ema(price_window, 12)
+                ema_26_val = TechnicalAnalyzer.calculate_ema(price_window, 26)
+                macd_values.append(ema_12_val - ema_26_val)
+        
+        if len(macd_values) >= 9:
+            signal = TechnicalAnalyzer.calculate_ema(macd_values, 9)
+        else:
+            signal = macd_values[-1] if macd_values else macd
+        
         histogram = macd - signal
         
         return macd, signal, histogram
@@ -262,80 +443,65 @@ class TechnicalAnalyzer:
         
         return indicators
 
-class MLPredictor:
-    """ML модель для прогнозирования"""
+class MLModel:
+    """Простая ML модель для пересчета весов на основе фидбека"""
     
-    def __init__(self):
-        self.model = None
-        self.is_trained = False
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+        self.weights = {
+            'volume_ratio': 0.3,
+            'price_momentum': 0.25,
+            'market_cap': 0.2,
+            'technical_indicators': 0.15,
+            'new_coin_bonus': 0.1
+        }
     
-    async def prepare_features(self, symbol: str, db: DatabaseManager) -> Optional[List[float]]:
-        """Подготавливает фичи для ML модели"""
+    async def retrain_model(self):
+        """Переобучает модель на основе исторических данных"""
         try:
-            historical_data = await db.get_historical_data(symbol, 60)
-            if len(historical_data) < 30:
-                return None
+            stats = await self.db.get_signal_stats(90)
             
-            prices = historical_data['price'].values
-            volumes = historical_data['volume_24h'].values
+            if stats.get('total_signals', 0) < 10:
+                logger.info("⚠️ Недостаточно данных для переобучения модели")
+                return
             
-            # Базовые фичи
-            features = [
-                # Ценовые фичи
-                prices[-1],  # текущая цена
-                np.mean(prices[-7:]),  # среднее за неделю
-                np.std(prices[-7:]),   # волатильность за неделю
-                
-                # Объемные фичи
-                volumes[-1],  # текущий объем
-                np.mean(volumes[-7:]),  # средний объем за неделю
-                
-                # Технические индикаторы
-                TechnicalAnalyzer.calculate_rsi(prices.tolist()),
-                TechnicalAnalyzer.calculate_ema(prices.tolist(), 12),
-                TechnicalAnalyzer.calculate_ema(prices.tolist(), 26),
-            ]
+            # Анализируем успешность различных факторов
+            success_rate = stats['success_rate']
+            new_coins_success = stats['new_coins_stats']['success_rate']
             
-            return features
+            # Корректируем веса на основе успешности
+            if new_coins_success > success_rate + 10:
+                # Новые монеты показывают лучшие результаты - увеличиваем бонус
+                self.weights['new_coin_bonus'] = min(0.2, self.weights['new_coin_bonus'] + 0.02)
+            elif new_coins_success < success_rate - 10:
+                # Новые монеты показывают худшие результаты - уменьшаем бонус
+                self.weights['new_coin_bonus'] = max(0.05, self.weights['new_coin_bonus'] - 0.02)
+            
+            # Анализ успешности по источникам
+            source_stats = stats.get('source_stats', {})
+            for source, data in source_stats.items():
+                if data['success_rate'] > success_rate + 15:
+                    logger.info(f"🎯 Источник {source} показывает отличные результаты: {data['success_rate']:.1f}%")
+            
+            logger.info(f"🔄 Модель переобучена. Новые веса: {self.weights}")
+            
         except Exception as e:
-            logger.error(f"Ошибка подготовки фич: {e}")
-            return None
+            logger.error(f"❌ Ошибка переобучения модели: {e}")
     
-    async def predict(self, symbol: str, db: DatabaseManager) -> float:
-        """Прогнозирует потенциал роста (0-100)"""
-        features = await self.prepare_features(symbol, db)
-        
-        if not features:
-            return 50  # нейтральный прогноз при отсутствии данных
-        
-        # Простая эвристическая модель (замените на настоящую ML модель)
-        base_score = 50
-        
-        # Корректировки на основе фич
-        rsi = features[5]
-        if rsi < 30:
-            base_score += 15  # перепроданность
-        elif rsi > 70:
-            base_score -= 15  # перекупленность
-        
-        volume_ratio = features[4] / features[3] if features[3] > 0 else 1
-        if volume_ratio > 1.5:
-            base_score += 10  # растущий объем
-        
-        ema_ratio = features[6] / features[7] if features[7] > 0 else 1
-        if ema_ratio > 1.02:
-            base_score += 10  # бычий тренд
-        
-        return max(0, min(100, base_score))
+    def get_weights(self) -> Dict[str, float]:
+        """Возвращает текущие веса модели"""
+        return self.weights.copy()
 
 class AdvancedAnalyzer:
-    """Продвинутый анализатор"""
+    """Продвинутый анализатор с поиском перспективных монет"""
     
     def __init__(self, db: DatabaseManager):
         self.db = db
         self.technical_analyzer = TechnicalAnalyzer()
-        self.ml_predictor = MLPredictor()
+        self.ml_model = MLModel(db)
         self.session = None
+        self.cache_manager = PotentialCoinsCache()
+        self.exclude_coins = {'usdt', 'usdc', 'busd', 'dai', 'tusd', 'ust', 'fdusd', 'pyusd'}
     
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -345,8 +511,8 @@ class AdvancedAnalyzer:
         if self.session:
             await self.session.close()
     
-    async def fetch_top_coins(self, limit: int = 100) -> List[Dict]:
-        """Асинхронно загружает топ монет"""
+    async def fetch_top_coins(self, limit: int = 50) -> List[Dict]:
+        """Загружает топ монет по рыночной капитализации"""
         url = "https://api.coingecko.com/api/v3/coins/markets"
         params = {
             "vs_currency": "usd",
@@ -362,74 +528,194 @@ class AdvancedAnalyzer:
                 if response.status == 200:
                     coins = await response.json()
                     filtered_coins = [
-                        coin for coin in coins 
-                        if coin['symbol'] not in ['usdt', 'usdc', 'busd', 'dai']
+                        {**coin, 'discovery_source': DiscoverySource.TOP_MARKET_CAP.value}
+                        for coin in coins 
+                        if coin['symbol'] not in self.exclude_coins
                     ]
-                    logger.info(f"✅ Успешно загружено {len(filtered_coins)} монет")
+                    logger.info(f"✅ Загружено топ {len(filtered_coins)} монет")
                     return filtered_coins
                 else:
-                    logger.error(f"❌ Ошибка API: {response.status}")
+                    logger.error(f"❌ Ошибка API при загрузке топ монет: {response.status}")
                     return []
         except Exception as e:
-            logger.error(f"❌ Ошибка загрузки монет: {e}")
+            logger.error(f"❌ Ошибка загрузки топ монет: {e}")
             return []
     
+    async def fetch_potential_coins(self, limit: int = 150) -> List[Dict]:
+        """Ищет перспективные новые и низкорейтинговые монеты"""
+        
+        # Пробуем загрузить из кэша
+        cached_coins = self.cache_manager.load_cache()
+        if cached_coins is not None:
+            return cached_coins
+        
+        logger.info("🔄 Поиск перспективных монет...")
+        potential_coins = []
+        
+        try:
+            # Стратегия: Поиск по рынкам с фильтрацией
+            url = "https://api.coingecko.com/api/v3/coins/markets"
+            
+            for page in range(1, 5):  # Проверяем первые 4 страницы (200 монет)
+                params = {
+                    "vs_currency": "usd",
+                    "order": "volume_desc",  # Сортировка по объему
+                    "per_page": 50,
+                    "page": page,
+                    "sparkline": "false",
+                    "price_change_percentage": "7d,30d"
+                }
+                
+                async with self.session.get(url, params=params, timeout=30) as response:
+                    if response.status == 200:
+                        coins = await response.json()
+                        
+                        for coin in coins:
+                            if self._is_potential_coin(coin):
+                                coin_data = {
+                                    **coin,
+                                    'discovery_source': DiscoverySource.VOLUME_SCREENER.value,
+                                    'is_new': self._check_if_new_coin(coin)
+                                }
+                                potential_coins.append(coin_data)
+                    
+                    await asyncio.sleep(1)  # Rate limiting
+            
+            # Ограничиваем количество и сохраняем в кэш
+            potential_coins = potential_coins[:limit]
+            self.cache_manager.save_cache(potential_coins)
+            
+            logger.info(f"✅ Найдено {len(potential_coins)} перспективных монет")
+            return potential_coins
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка поиска перспективных монет: {e}")
+            return []
+    
+    def _is_potential_coin(self, coin: Dict) -> bool:
+        """Проверяет, соответствует ли монета критериям перспективности"""
+        try:
+            # Базовые проверки
+            if coin['symbol'] in self.exclude_coins:
+                return False
+            
+            if not coin.get('market_cap') or coin['market_cap'] is None:
+                return False
+            
+            if not coin.get('total_volume') or coin['total_volume'] is None:
+                return False
+            
+            # Основные критерии
+            market_cap = coin['market_cap']
+            volume_24h = coin['total_volume']
+            price_change_7d = coin.get('price_change_percentage_7d_in_currency', 0) or 0
+            
+            # Критерии отбора
+            criteria = [
+                market_cap < 50000000,           # Капитализация < $50M
+                volume_24h > 100000,            # Объем > $100K
+                price_change_7d > 30,           # Рост за 7 дней > 30%
+                volume_24h / max(market_cap, 1) > 0.05,  # Volume/MCAP ratio > 5%
+            ]
+            
+            return all(criteria)
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки монеты {coin.get('symbol', 'unknown')}: {e}")
+            return False
+    
+    def _check_if_new_coin(self, coin: Dict) -> bool:
+        """Проверяет, является ли монета новой (< 90 дней)"""
+        # Эвристика: новые монеты часто имеют высокий volume/mcap ratio
+        # и относительно низкую капитализацию
+        market_cap = coin.get('market_cap', 0)
+        volume_ratio = coin['total_volume'] / max(market_cap, 1)
+        
+        return volume_ratio > 0.3 and market_cap < 20000000
+    
     async def calculate_advanced_score(self, coin: Dict, indicators: TechnicalIndicators) -> Tuple[int, Dict]:
-        """Расширенный расчет score с ML и техническими индикаторами"""
+        """Расширенный расчет score с ML весами"""
         score = 0
         analysis = {}
+        weights = self.ml_model.get_weights()
         
         try:
             symbol = coin['symbol'].upper()
             
-            # 1. Базовые метрики (40%)
+            # 1. Volume Ratio (30%)
             volume_ratio = coin['total_volume'] / coin['market_cap'] if coin['market_cap'] > 0 else 0
-            price_change_24h = coin.get('price_change_percentage_24h', 0) or 0
+            volume_score = 0
             
             if volume_ratio > 0.3:
-                score += 20
+                volume_score = 30
                 analysis['volume'] = "🔥 Экстремальный объем"
             elif volume_ratio > 0.15:
-                score += 15
+                volume_score = 20
                 analysis['volume'] = "📈 Высокий объем"
             elif volume_ratio > 0.05:
-                score += 10
+                volume_score = 10
                 analysis['volume'] = "💹 Хороший объем"
             
-            if 5 < price_change_24h < 50:
-                score += 20
-                analysis['momentum'] = f"🚀 Рост +{price_change_24h:.1f}%"
+            score += volume_score * weights['volume_ratio']
             
-            # 2. Технические индикаторы (30%)
+            # 2. Price Momentum (25%)
+            price_change_24h = coin.get('price_change_percentage_24h', 0) or 0
+            price_change_7d = coin.get('price_change_percentage_7d_in_currency', 0) or 0
+            momentum_score = 0
+            
+            if 10 < price_change_24h < 50 and price_change_7d > 20:
+                momentum_score = 25
+                analysis['momentum'] = f"🚀 Сильный рост +{price_change_24h:.1f}% (7д: +{price_change_7d:.1f}%)"
+            elif 5 < price_change_24h < 10 and price_change_7d > 10:
+                momentum_score = 15
+                analysis['momentum'] = f"📈 Умеренный рост +{price_change_24h:.1f}%"
+            
+            score += momentum_score * weights['price_momentum']
+            
+            # 3. Market Cap (20%)
+            market_cap = coin['market_cap']
+            market_cap_score = 0
+            
+            if market_cap < 50000000:
+                market_cap_score = 20
+                analysis['market_cap'] = "🏦 Малая капа - высокий потенциал"
+            elif market_cap < 200000000:
+                market_cap_score = 10
+                analysis['market_cap'] = "🏦 Средняя капа"
+            
+            score += market_cap_score * weights['market_cap']
+            
+            # 4. Technical Indicators (15%)
+            technical_score = 0
             if indicators.rsi < 35:
-                score += 15
+                technical_score += 8
                 analysis['rsi'] = f"📊 RSI {indicators.rsi:.1f} - перепроданность"
             elif indicators.rsi > 65:
-                score -= 10
+                technical_score -= 5
                 analysis['rsi'] = f"⚠️ RSI {indicators.rsi:.1f} - перекупленность"
             
             if indicators.macd > indicators.macd_signal:
-                score += 15
+                technical_score += 7
                 analysis['macd'] = "📈 MACD бычий"
             
-            # 3. ML прогноз (30%)
-            ml_score = await self.ml_predictor.predict(symbol, self.db)
-            ml_contribution = ml_score * 0.3
-            score += ml_contribution
-            analysis['ml'] = f"🤖 ML score: {ml_score:.1f}/100"
+            score += technical_score * weights['technical_indicators']
             
-            # 4. Risk adjustment
+            # 5. Risk Adjustment
             if price_change_24h > 80:
-                score -= 20
+                score -= 15
                 analysis['risk'] = "💥 Высокий риск коррекции"
-            
+            elif price_change_24h < -20:
+                score += 5  # Возможность отскока
+                analysis['risk'] = f"🔄 Просадка {price_change_24h:.1f}% - потенциал отскока"
+                
         except Exception as e:
             logger.error(f"❌ Ошибка расчета score: {e}")
         
-        return max(0, min(100, int(score))), analysis
+        base_score = max(0, min(100, int(score)))
+        return base_score, analysis
     
     async def analyze_coin(self, coin_data: Dict) -> Optional[Dict]:
-        """Полный анализ монеты"""
+        """Полный анализ монеты с улучшенной логикой"""
         try:
             symbol = coin_data['symbol'].upper()
             
@@ -442,7 +728,9 @@ class AdvancedAnalyzer:
                 volume_24h=coin_data['total_volume'],
                 price_change_24h=coin_data.get('price_change_percentage_24h', 0) or 0,
                 price_change_7d=coin_data.get('price_change_percentage_7d_in_currency', 0) or 0,
-                timestamp=datetime.now()
+                timestamp=datetime.now(),
+                is_new=coin_data.get('is_new', False),
+                discovery_source=coin_data.get('discovery_source', DiscoverySource.TOP_MARKET_CAP.value)
             )
             await self.db.save_coin_data(coin_obj)
             
@@ -450,19 +738,34 @@ class AdvancedAnalyzer:
             indicators = await self.technical_analyzer.calculate_indicators(symbol, self.db)
             
             # Рассчитываем score
-            score, analysis = await self.calculate_advanced_score(coin_data, indicators)
+            base_score, analysis = await self.calculate_advanced_score(coin_data, indicators)
+            
+            # Применяем бонус для новых монет
+            final_score = base_score
+            bonus_applied = 0
+            
+            if coin_data.get('is_new', False):
+                bonus = 15
+                final_score = min(100, base_score + bonus)
+                bonus_applied = bonus
+                analysis['new_coin_bonus'] = f"🆕 НОВАЯ МОНЕТА - бонус +{bonus}%"
             
             return {
                 'symbol': symbol,
                 'name': coin_data['name'],
-                'score': score,
+                'score': final_score,
+                'base_score': base_score,
                 'price': coin_data['current_price'],
                 'price_change_24h': coin_data.get('price_change_percentage_24h', 0) or 0,
+                'price_change_7d': coin_data.get('price_change_percentage_7d_in_currency', 0) or 0,
                 'market_cap': coin_data['market_cap'],
                 'volume': coin_data['total_volume'],
                 'volume_ratio': coin_data['total_volume'] / coin_data['market_cap'] if coin_data['market_cap'] > 0 else 0,
                 'analysis': analysis,
-                'technical_indicators': indicators,
+                'technical_indicators': asdict(indicators),
+                'is_new': coin_data.get('is_new', False),
+                'discovery_source': coin_data.get('discovery_source', DiscoverySource.TOP_MARKET_CAP.value),
+                'bonus_applied': bonus_applied,
                 'timestamp': datetime.now()
             }
             
@@ -471,7 +774,7 @@ class AdvancedAnalyzer:
             return None
 
 class CryptoAdvancedBot:
-    """Продвинутый крипто-бот"""
+    """Продвинутый крипто-бот с автообучением"""
     
     def __init__(self, token: str, chat_id: str):
         self.token = token
@@ -479,9 +782,9 @@ class CryptoAdvancedBot:
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.db = DatabaseManager()
         self.is_processing = False
-        self.last_manual_update = 0
         self.cached_predictions = None
         self.last_successful_update = None
+        self.last_stats_update = datetime.now() - timedelta(hours=24)
     
     async def send_message(self, text: str, reply_markup: Dict = None) -> bool:
         """Асинхронная отправка сообщения"""
@@ -514,190 +817,41 @@ class CryptoAdvancedBot:
             self.is_processing = False
         return False
     
-    def create_signal_keyboard(self, symbol: str, signal_id: int) -> Dict:
-        """Создает кнопки для сигналов с ID"""
-        return {
-            'inline_keyboard': [
-                [
-                    {'text': '✅ СРАБОТАЛ', 'callback_data': f'success_{signal_id}_{symbol}'},
-                    {'text': '❌ НЕ СРАБОТАЛ', 'callback_data': f'fail_{signal_id}_{symbol}'}
-                ],
-                [
-                    {'text': '💡 ЧАСТИЧНО', 'callback_data': f'partial_{signal_id}_{symbol}'}
-                ]
-            ]
-        }
-    
-    async def send_signal(self, analysis: Dict) -> bool:
-        """Отправляет торговый сигнал"""
-        symbol = analysis['symbol']
-        
-        # Сохраняем сигнал в БД
-        signal_id = await self.db.save_signal(
-            symbol=symbol,
-            score=analysis['score'],
-            price=analysis['price'],
-            signal_type="AUTO",
-            analysis=analysis['analysis']
-        )
-        
-        if not signal_id:
-            return False
-        
-        # Форматируем сообщение
-        message = await self.format_signal_message(analysis)
-        keyboard = self.create_signal_keyboard(symbol, signal_id)
-        
-        return await self.send_message(message, keyboard)
+    def format_price(self, price: float) -> str:
+        """Форматирует цену в зависимости от величины"""
+        if price is None:
+            return "N/A"
+        elif price < 0.001:
+            return f"${price:.8f}"
+        elif price < 1:
+            return f"${price:.6f}"
+        else:
+            return f"${price:.2f}"
     
     async def format_signal_message(self, analysis: Dict) -> str:
-        """Форматирует сообщение сигнала"""
+        """Форматирует сообщение сигнала с информацией о типе монеты"""
         symbol = analysis['symbol']
         price = analysis['price']
         
-        # Форматируем цену
-        if price < 0.001:
-            price_str = f"${price:.8f}"
-        elif price < 1:
-            price_str = f"${price:.6f}"
+        # Заголовок с типом монеты
+        if analysis.get('is_new'):
+            header = f"🎯 <b>СИГНАЛ - {symbol} 🆕 НОВАЯ МОНЕТА</b>"
+        elif analysis.get('discovery_source') == DiscoverySource.VOLUME_SCREENER.value:
+            header = f"🎯 <b>СИГНАЛ - {symbol} 📈 ВОСХОДЯЩАЯ ЗВЕЗДА</b>"
         else:
-            price_str = f"${price:.2f}"
+            header = f"🎯 <b>СИГНАЛ - {symbol}</b>"
         
         message = f"""
-🎯 <b>СИГНАЛ - {symbol}</b>
+{header}
 
 ⭐ <b>Score:</b> {analysis['score']}/100
-💰 <b>Цена:</b> {price_str}
+💰 <b>Цена:</b> {self.format_price(price)}
 📊 <b>Изменение 24ч:</b> {analysis['price_change_24h']:.1f}%
+🚀 <b>Изменение 7д:</b> {analysis['price_change_7d']:.1f}%
 🏦 <b>Капитализация:</b> ${analysis['market_cap']:,.0f}
+💧 <b>Объем/Капитализация:</b> {analysis['volume_ratio']:.2%}
 
-<b>ТЕХНИЧЕСКИЙ АНАЛИЗ:</b>
+<b>АНАЛИЗ:</b>
 """
         
-        for metric, desc in analysis['analysis'].items():
-            message += f"• {desc}\n"
-        
-        # Добавляем ML информацию
-        if 'ml' in analysis['analysis']:
-            message += f"\n<b>ML ПРОГНОЗ:</b>\n"
-            message += f"• {analysis['analysis']['ml']}\n"
-        
-        message += f"\n💡 <i>Отметь результат для обучения системы!</i>"
-        
-        return message
-    
-    async def process_feedback(self, callback_data: str):
-        """Обрабатывает фидбек пользователя"""
-        try:
-            parts = callback_data.split('_')
-            if len(parts) >= 3:
-                feedback_type = parts[0]
-                signal_id = int(parts[1])
-                symbol = parts[2]
-                
-                await self.db.save_feedback(signal_id, symbol, feedback_type)
-                
-                response_text = f"""
-✅ <b>ФИДБЕК ЗАПИСАН!</b>
-
-{symbol} - {feedback_type.upper()}
-
-Спасибо! Система учится на ваших оценках 🧠
-
-<b>Статистика фидбека:</b>
-• Успешные: {await self.get_feedback_stats('success')}
-• Неудачные: {await self.get_feedback_stats('fail')}  
-• Частичные: {await self.get_feedback_stats('partial')}
-"""
-                await self.send_message(response_text)
-                
-        except Exception as e:
-            logger.error(f"❌ Ошибка обработки фидбека: {e}")
-    
-    async def get_feedback_stats(self, feedback_type: str) -> int:
-        """Получает статистику фидбека"""
-        try:
-            with sqlite3.connect(self.db.db_path) as conn:
-                cursor = conn.execute(
-                    'SELECT COUNT(*) FROM feedback WHERE feedback_type = ?',
-                    (feedback_type,)
-                )
-                return cursor.fetchone()[0]
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения статистики: {e}")
-            return 0
-    
-    async def run_analysis_cycle(self):
-        """Запускает цикл анализа"""
-        logger.info("🔄 Запуск цикла анализа...")
-        
-        async with AdvancedAnalyzer(self.db) as analyzer:
-            coins_data = await analyzer.fetch_top_coins(100)
-            
-            if not coins_data:
-                logger.warning("⚠️ Не удалось получить данные монет")
-                return
-            
-            # Анализируем все монеты
-            analyses = []
-            for coin in coins_data:
-                analysis = await analyzer.analyze_coin(coin)
-                if analysis and analysis['score'] >= 60:  # Минимальный порог
-                    analyses.append(analysis)
-            
-            # Сортируем по score
-            analyses.sort(key=lambda x: x['score'], reverse=True)
-            self.cached_predictions = analyses[:10]
-            self.last_successful_update = datetime.now()
-            
-            # Отправляем топ-3 сигнала
-            for analysis in analyses[:3]:
-                if analysis['score'] >= 75:  # Высокий порог для сигналов
-                    await self.send_signal(analysis)
-                    await asyncio.sleep(1)  # Задержка между сообщениями
-            
-            logger.info(f"✅ Анализ завершен. Найдено {len(analyses)} перспективных монет")
-
-async def main():
-    """Основная функция"""
-    # Конфигурация
-    BOT_TOKEN = "8406686288:AAHSHNwi_ocevorBddn5P_6Oc70aMx0-Usc"
-    CHAT_ID = "6823451625"
-    
-    bot = CryptoAdvancedBot(BOT_TOKEN, CHAT_ID)
-    
-    # Приветственное сообщение
-    await bot.send_message("""
-🤖 <b>ПРОДВИНУТАЯ СИСТЕМА АНАЛИЗА КРИПТО ЗАПУЩЕНА</b>
-
-🚀 <b>НОВЫЕ ВОЗМОЖНОСТИ:</b>
-• 🤖 ML-прогнозирование
-• 📊 Технические индикаторы (RSI, MACD, EMA)
-• 🧠 Обучение на фидбеке
-• 💾 Сохранение истории в БД
-• ⚡ Асинхронная обработка
-
-📈 <b>СИСТЕМА АНАЛИЗИРУЕТ:</b>
-• Топ-100 криптовалют
-• Volume/Market Cap соотношения  
-• Технические индикаторы
-• ML-прогнозы роста
-• Новостные упоминания
-
-⚡ <i>Авто-обновление каждые 15 минут</i>
-""")
-    
-    # Основной цикл
-    while True:
-        try:
-            await bot.run_analysis_cycle()
-            logger.info("💤 Ожидание следующего цикла анализа (15 минут)...")
-            await asyncio.sleep(15 * 60)  # 15 минут
-            
-        except Exception as e:
-            logger.error(f"❌ Критическая ошибка в основном цикле: {e}")
-            await asyncio.sleep(60)  # Ждем минуту перед повторной попыткой
-
-if __name__ == "__main__":
-    # Запуск бота
-    asyncio.run(main())
+        for metric, desc in analysis['analysis'].
